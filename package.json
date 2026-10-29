@@ -1,0 +1,21 @@
+{
+  "name": "opencode-netz-retry",
+  "version": "0.1.0",
+  "description": "OpenCode plugin: keep requests alive through network/DNS failures; auto re-prompt after final transport errors",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin"
+  ],
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  },
+  "license": "MIT"
+}
