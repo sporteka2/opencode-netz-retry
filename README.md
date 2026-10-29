@@ -57,8 +57,8 @@ Options (via the object plugin form):
   carried over.
 - Restriction on layer 1: the built-in retry attempt cap is a hard limit in
   OpenCode; a plugin hook can mark failures as retryable but cannot raise or
-  remove the cap. A feature request for a configurable limit lives in the
-  linked repository issue.
+  remove the cap (`anomalyco/opencode#60122`). A feature request for a
+  configurable limit lives in the linked repository issue.
 - Plugin logs go to `~/.local/share/opencode/log/opencode.log` with the
   `[netz-retry]` prefix.
 
