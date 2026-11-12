@@ -81,8 +81,12 @@ export default Plugin.define({
       dbg(`${PLUGIN} event subscription started`)
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         try {
-          const typed = event as { id?: string; type?: string; data?: FailureEventData }
+          const typed = event as { id?: string; type?: string; data?: FailureEventData; properties?: FailureEventData }
           const type = typed.type ?? ""
+          if (type.includes("failed")) {
+            dbg(`${PLUGIN} raw failed event: ${JSON.stringify(event).slice(0, 500)}`)
+          }
+          const data = (typed.data ?? typed.properties) ?? {}
           if (
             type !== "session.execution.failed" &&
             type !== "session.execution.interrupted" &&
@@ -96,7 +100,6 @@ export default Plugin.define({
             seenEvents.add(typed.id)
             if (seenEvents.size > 5_000) seenEvents.clear()
           }
-          const data = typed.data ?? {}
           const sessionID = data.sessionID
           if (!sessionID) continue
           const err = data.error ?? {}
