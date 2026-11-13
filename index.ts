@@ -103,7 +103,7 @@ function sweepLocks(): void {
     for (const f of readdirSync(LOCK_DIR) as string[]) {
       const p = `${LOCK_DIR}/${f}`
       try {
-        if (Date.now() - Number(readFileSync(p, "utf8")) > 30 * 60_000) unlinkSync(p)
+        if (Date.now() - Number(readFileSync(p, "utf8")) > 5 * 60_000) unlinkSync(p)
       } catch { /* ignore */ }
     }
   } catch { /* no locks yet */ }
@@ -353,25 +353,6 @@ export default Plugin.define({
       directory: string | undefined,
       fromScan = false,
     ): Promise<void> {
-      sessionID: string,
-      err: ErrShape,
-      directory: string | undefined,
-      fromScan = false,
-    ): Promise<void> {
-      if (paused()) {
-        dbg(`${PLUGIN} paused via ${PAUSE_FILE}, not recovering ${sessionID}`)
-        return
-      }
-      if (!lockSession(sessionID)) {
-        dbg(`${PLUGIN} another instance is already recovering ${sessionID}, skipping`)
-        return
-      }
-      try {
-        await handleFailureLocked(sessionID, err, directory, fromScan)
-      } finally {
-        releaseLock(sessionID)
-      }
-    }
       let kind = classify(err.type, err.message)
       if (kind !== "unknown") {
         knownKind.set(sessionID, kind)
@@ -481,11 +462,16 @@ export default Plugin.define({
         return
       }
       try {
-        await handleFailureLocked(sessionID, err, directory, fromScan)
+        // Bound every recovery: a hung provider call must not hold the lock.
+        const timeout = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("recovery timeout")), 60_000),
+        )
+        await Promise.race([handleFailureLocked(sessionID, err, directory, fromScan), timeout])
+      } catch (e) {
+        dbg(`${PLUGIN} recovery attempt failed for ${sessionID}: ${e instanceof Error ? e.message : String(e)}`)
       } finally {
         releaseLock(sessionID)
       }
-    }
 
 
     // 2) Event-driven recovery.
@@ -556,6 +542,22 @@ export default Plugin.define({
       let checked = 0
       let recovered = 0
       sweepLocks()
+      // One watchdog at a time: several per-location instances would otherwise
+      // all scan all directories every cycle.
+      // Lease-style lock: stale (older than a scan cycle) leases are taken over.
+      try {
+        writeFileSync(`${LOCK_DIR}/watchdog`, String(Date.now()), { flag: "wx" })
+      } catch {
+        try {
+          if (Date.now() - Number(readFileSync(`${LOCK_DIR}/watchdog`, "utf8")) > 90_000) {
+            writeFileSync(`${LOCK_DIR}/watchdog`, String(Date.now()))
+          } else {
+            return
+          }
+        } catch {
+          return
+        }
+      }
       // One recovery per session per scan pass, even if several directories
       // list the same session.
       const handled = new Set<string>()
@@ -631,6 +633,14 @@ export default Plugin.define({
       }
       if (checked || recovered) {
         dbg(`${PLUGIN} scan done: ${checked} sessions checked, ${recovered} recovered`)
+        try {
+          unlinkSync(`${LOCK_DIR}/watchdog`)
+        } catch { /* already released */ }
+      } else {
+        try {
+          unlinkSync(`${LOCK_DIR}/watchdog`)
+        } catch { /* already released */ }
+      }
         try {
           appendFileSync(
             `${DEBUG}.status`,
