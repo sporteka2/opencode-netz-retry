@@ -1,5 +1,13 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, mkdirSync, existsSync } from "node:fs"
+import {
+  appendFileSync,
+  mkdirSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  unlinkSync,
+} from "node:fs"
 
 // Failures worth retrying in-request: DNS/connectivity plus transient HTTP
 // errors from the provider (429, 502/503/504 and "Internal server error").
@@ -48,6 +56,58 @@ const PAUSE_FILE = "/tmp/opencode/netz-retry-paused"
 
 const PLUGIN = "[netz-retry]"
 const DEBUG = "/tmp/opencode/netz-retry-debug.log"
+const CHAIN_FILE = "/tmp/opencode/netz-retry-chain.json"
+const LOCK_DIR = "/tmp/opencode/netz-retry-locks"
+
+/** Cross-restart recovery-chain state, so reloading the plugin cannot reset
+ *  the budget of a chain that is already three sessions deep. */
+function loadChain(): { createdBy: Record<string, string>; depth: Record<string, number> } {
+  try {
+    const raw = readFileSync(CHAIN_FILE, "utf8")
+    const parsed = JSON.parse(raw) as { createdBy?: Record<string, string>; depth?: Record<string, number> }
+    return { createdBy: parsed.createdBy ?? {}, depth: parsed.depth ?? {} }
+  } catch {
+    return { createdBy: {}, depth: {} }
+  }
+}
+function saveChain(createdBy: Map<string, string>, depth: Map<string, number>): void {
+  try {
+    mkdirSync("/tmp/opencode", { recursive: true })
+    writeFileSync(
+      CHAIN_FILE,
+      JSON.stringify({
+        createdBy: Object.fromEntries(createdBy),
+        depth: Object.fromEntries(depth),
+      }),
+    )
+  } catch { /* persistence is best-effort */ }
+}
+/** Atomic per-session action lock: prevents two plugin instances (per-location
+ *  runtimes) from recovering the same session at the same time. */
+function lockSession(sessionID: string): boolean {
+  try {
+    mkdirSync(LOCK_DIR, { recursive: true })
+    writeFileSync(`${LOCK_DIR}/${sessionID}`, String(Date.now()), { flag: "wx" })
+    return true
+  } catch {
+    return false
+  }
+}
+function releaseLock(sessionID: string): void {
+  try {
+    unlinkSync(`${LOCK_DIR}/${sessionID}`)
+  } catch { /* already gone */ }
+}
+function sweepLocks(): void {
+  try {
+    for (const f of readdirSync(LOCK_DIR) as string[]) {
+      const p = `${LOCK_DIR}/${f}`
+      try {
+        if (Date.now() - Number(readFileSync(p, "utf8")) > 30 * 60_000) unlinkSync(p)
+      } catch { /* ignore */ }
+    }
+  } catch { /* no locks yet */ }
+}
 
 function dbg(line: string): void {
   try {
@@ -155,6 +215,15 @@ export default Plugin.define({
     // a failing session cannot spawn recoveries indefinitely.
     const createdBy = new Map<string, string>()
     const chainDepth = new Map<string, number>()
+    {
+      const persisted = loadChain()
+      for (const [k, v] of Object.entries(persisted.createdBy)) createdBy.set(k, v)
+      for (const [k, v] of Object.entries(persisted.depth)) chainDepth.set(k, v)
+    }
+    // Last observed failure kind + raw error per session, so the scan can
+    // classify a failed marker it has no error text for.
+    const knownKind = new Map<string, FailureKind>()
+    const rememberedErr = new Map<string, ErrShape>()
     const originOf = (id: string): string => {
       let cur = id
       for (let i = 0; i < MAX_CHAIN + 2; i++) {
@@ -225,6 +294,7 @@ export default Plugin.define({
       if (!newID) throw new Error("session.create returned no id")
       createdBy.set(newID, sessionID)
       chainDepth.set(newID, (chainDepth.get(sessionID) ?? 0) + 1)
+      saveChain(createdBy, chainDepth)
       await api.session!.prompt({ sessionID: newID, text: preamble, delivery: "queue" })
       dbg(`${PLUGIN} safety recovery: ${sessionID} → ${newID} (dir=${dir}, depth=${chainDepth.get(newID)})`)
     }
@@ -277,7 +347,12 @@ export default Plugin.define({
      *  uses one conservative re-prompt per attempt, capped per session. */
     const scanAttempts = new Map<string, number>()
     const stuckAttempts = new Map<string, number>()
-    async function handleFailure(
+    async function handleFailureLocked(
+      sessionID: string,
+      err: ErrShape,
+      directory: string | undefined,
+      fromScan = false,
+    ): Promise<void> {
       sessionID: string,
       err: ErrShape,
       directory: string | undefined,
@@ -287,7 +362,21 @@ export default Plugin.define({
         dbg(`${PLUGIN} paused via ${PAUSE_FILE}, not recovering ${sessionID}`)
         return
       }
+      if (!lockSession(sessionID)) {
+        dbg(`${PLUGIN} another instance is already recovering ${sessionID}, skipping`)
+        return
+      }
+      try {
+        await handleFailureLocked(sessionID, err, directory, fromScan)
+      } finally {
+        releaseLock(sessionID)
+      }
+    }
       let kind = classify(err.type, err.message)
+      if (kind !== "unknown") {
+        knownKind.set(sessionID, kind)
+        rememberedErr.set(sessionID, err)
+      }
       if (fromScan && kind === "unknown") {
         const n = (scanAttempts.get(sessionID) ?? 0) + 1
         scanAttempts.set(sessionID, n)
@@ -377,6 +466,27 @@ export default Plugin.define({
           dbg(`${PLUGIN} unrecoverable failure for ${sessionID}: ${reason} — logging only`)
       }
     }
+    async function handleFailure(
+      sessionID: string,
+      err: ErrShape,
+      directory: string | undefined,
+      fromScan = false,
+    ): Promise<void> {
+      if (paused()) {
+        dbg(`${PLUGIN} paused via ${PAUSE_FILE}, not recovering ${sessionID}`)
+        return
+      }
+      if (!lockSession(sessionID)) {
+        dbg(`${PLUGIN} another instance is already recovering ${sessionID}, skipping`)
+        return
+      }
+      try {
+        await handleFailureLocked(sessionID, err, directory, fromScan)
+      } finally {
+        releaseLock(sessionID)
+      }
+    }
+
 
     // 2) Event-driven recovery.
     const g = globalThis as { __netzRetryLoop?: AbortController }
@@ -445,6 +555,10 @@ export default Plugin.define({
     async function scan(): Promise<void> {
       let checked = 0
       let recovered = 0
+      sweepLocks()
+      // One recovery per session per scan pass, even if several directories
+      // list the same session.
+      const handled = new Set<string>()
       for (const dir of [...dirs]) {
         let list: SessionInfoLite[] = []
         try {
@@ -456,7 +570,8 @@ export default Plugin.define({
         }
         for (const s of list) {
           const sessionID = s.id ?? s.info?.id
-          if (!sessionID) continue
+          if (!sessionID || handled.has(sessionID)) continue
+          handled.add(sessionID)
           const updated = s.time?.updated ?? s.info?.time?.updated
           // Failed sessions are by definition stale, so do not skip them by recency;
           // only skip sessions untouched for a day (abandoned).
@@ -507,10 +622,22 @@ export default Plugin.define({
           failedAt.set(sessionID, failedTime)
           dbg(`${PLUGIN} scan: new failed state in ${sessionID} at ${new Date(failedTime).toISOString()}`)
           recovered++
-          await handleFailure(sessionID, { type: "unknown", message: "" }, dir, true)
+          // Reuse the last classified kind for this session when available:
+          // the failed marker itself carries no error text.
+          const remembered = knownKind.get(sessionID) ?? "unknown"
+          dbg(`${PLUGIN} scan: recovering ${sessionID} as "${remembered}" (last known kind)`)
+          await handleFailure(sessionID, rememberedErr.get(sessionID) ?? { type: "unknown", message: "" }, dir, remembered === "unknown")
         }
       }
-      if (checked || recovered) dbg(`${PLUGIN} scan done: ${checked} sessions checked, ${recovered} recovered`)
+      if (checked || recovered) {
+        dbg(`${PLUGIN} scan done: ${checked} sessions checked, ${recovered} recovered`)
+        try {
+          appendFileSync(
+            `${DEBUG}.status`,
+            `${new Date().toISOString()} checked=${checked} recovered=${recovered} dirs=${dirs.size} failedTracked=${failedAt.size} recoveries=${recoveries.size}\n`,
+          )
+        } catch { /* status file is best-effort */ }
+      }
     }
 
     const scanT = setInterval(() => void scan().catch((e) => dbg(`${PLUGIN} scan failed: ${e instanceof Error ? e.message : String(e)}`)), SCAN_MS)
