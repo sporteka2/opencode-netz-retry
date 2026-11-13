@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 import { appendFileSync, mkdirSync, existsSync } from "node:fs"
 
-// Failures worth retrying: DNS/connectivity problems plus transient HTTP
+// Failures worth retrying in-request: DNS/connectivity plus transient HTTP
 // errors from the provider (429, 502/503/504 and "Internal server error").
 // Deliberately excludes auth and validation errors: those never succeed on
 // retry and would just hammer a working credential.
@@ -17,10 +17,16 @@ const SAFETY = /content safety screening|safety (?:filter|screening|system)|mode
 // one model/CLI call. Recoverable by batching on the next attempt.
 const IMAGES_LIMIT = /at most \d+ image|limit-mm-per-prompt/i
 
+// Deterministic provider-side errors that a different provider route avoids:
+// NVIDIA "functions" that do not exist for the account, and gateway billing.
+const PROVIDER_404 =
+  /Function id .* not found|Specified function in account .* is not found|functions? .* (?:not found|not available)/i
+const GATEWAY = /credit card|AI Gateway requires|billing|payment required|insufficient (?:quota|credits)/i
+
 const IMAGES_HINT =
   "\n\n[автоподсказка] Внешний CLI принимает максимум 8 изображений в одном запросе — разбей на батчи по 8 и суммируй результаты. Ошибку 'At most 8 image(s)' не повторяй."
 
-type FailureKind = "network" | "safety" | "images" | "unknown"
+type FailureKind = "network" | "safety" | "images" | "switch" | "unknown"
 
 function retryable(type?: string, message?: string): boolean {
   return NETWORK_MESSAGE.test(message ?? "") || NETWORK_TYPE.test(type ?? "")
@@ -30,6 +36,7 @@ function classify(type?: string, message?: string): FailureKind {
   const blob = `${type ?? ""}\n${message ?? ""}`
   if (SAFETY.test(blob)) return "safety"
   if (IMAGES_LIMIT.test(blob)) return "images"
+  if (PROVIDER_404.test(blob) || GATEWAY.test(blob)) return "switch"
   if (retryable(type, message)) return "network"
   return "unknown"
 }
@@ -47,14 +54,20 @@ function dbg(line: string): void {
     mkdirSync("/tmp/opencode", { recursive: true })
     appendFileSync(DEBUG, `${new Date().toISOString()} ${line}\n`)
   } catch (err) {
-    // debug logging must never break the plugin; surface why it failed
     console.log(`${PLUGIN} fs-debug unavailable:`, err instanceof Error ? err.message : err)
   }
 }
 
-interface FailureEventData {
-  sessionID?: string
-  error?: { type?: string; message?: string; status?: number }
+interface ErrShape {
+  type?: string
+  message?: string
+}
+
+interface SessionInfoLite {
+  id?: string
+  info?: { id?: string; title?: string; time?: { updated?: number; created?: number } }
+  title?: string
+  time?: { updated?: number; created?: number }
 }
 
 interface Ctx {
@@ -64,10 +77,11 @@ interface Ctx {
       model?: { providerID?: string; id?: string }
       info?: { model?: { providerID?: string; id?: string } }
     }>
-    create(input: { directory?: string; title?: string }): Promise<{
-      id?: string
-      info?: { id?: string }
+    list(input: { directory?: string; limit?: number }): Promise<{
+      data?: SessionInfoLite[]
+      info?: SessionInfoLite[]
     }>
+    create(input: { directory?: string; title?: string }): Promise<{ id?: string; info?: { id?: string } }>
     prompt(input: {
       sessionID: string
       text: string
@@ -75,6 +89,11 @@ interface Ctx {
       model?: { providerID: string; id: string }
       delivery?: "queue" | "steer"
     }): Promise<unknown>
+    switchModel(input: {
+      sessionID: string
+      model: { providerID: string; id: string }
+    }): Promise<unknown>
+    interrupt(input: { sessionID: string }): Promise<{ interrupted?: boolean }>
   }
   location?: { directory?: string }
 }
@@ -105,18 +124,63 @@ export default Plugin.define({
   id: "netz-retry",
   async setup(ctx) {
     const api = ctx as unknown as Ctx
-    const options = (ctx.options as { reprompt?: boolean; delay?: number } | undefined) ?? {}
+    const options = (ctx.options as
+      | {
+          reprompt?: boolean
+          delay?: number
+          scanMs?: number
+          fallback?: Array<{ providerID: string; id: string }>
+          stuckMs?: number
+        }
+      | undefined) ?? {}
     const REPROMPT = options.reprompt !== false
     const DELAY = Math.max(1_000, options.delay ?? 10_000)
-    // Safety valves: re-prompt cycles per session, and clean-context recoveries.
+    const SCAN_MS = Math.max(60_000, options.scanMs ?? 180_000)
+    // A step silent for this long is treated as hung (headerTimeout:false
+    // means a dead socket never errors by itself).
+    const STUCK_MS = Math.max(120_000, options.stuckMs ?? 600_000)
+    // Provider to switch to when the current route fails deterministically
+    // (missing NVIDIA "functions", gateway without billing, ...).
+    const FALLBACK: Array<{ providerID: string; id: string }> =
+      options.fallback && options.fallback.length
+        ? options.fallback
+        : [{ providerID: "cloudflare-workers-ai", id: "@cf/zai-org/glm-4.7-flash" }]
+    // Safety valves.
     const MAX_REPROMPTS = 120
     const MAX_RECOVERIES = 3
+    // Depth of automatic recovery chains (a recovery of a recovery of ...).
+    const MAX_CHAIN = 3
 
-    // Per-session counters and dedupe of execution-failure events (the stream
-    // can deliver one event twice).
+    // child → origin: recovery sessions count toward the origin's budget so
+    // a failing session cannot spawn recoveries indefinitely.
+    const createdBy = new Map<string, string>()
+    const chainDepth = new Map<string, number>()
+    const originOf = (id: string): string => {
+      let cur = id
+      for (let i = 0; i < MAX_CHAIN + 2; i++) {
+        const parent = createdBy.get(cur)
+        if (!parent) break
+        cur = parent
+      }
+      return cur
+    }
+
     const cycles = new Map<string, number>()
     const recoveries = new Map<string, number>()
+    const switches = new Map<string, number>()
+    const failedAt = new Map<string, number>()
     const seenEvents = new Set<string>()
+    // Known project directories, overridable via the `directories` option. The
+    // globalThis guard keeps a single plugin instance, so its seed list must
+    // cover every location that hosts sessions.
+    const DEFAULT_DIRS = [
+      api.location?.directory,
+      "/home/user",
+      "/home/user/Desktop/quran",
+      "/home/user/Desktop/themes",
+      "/home/user/media-server",
+    ].filter((d): d is string => typeof d === "string" && d.length > 0)
+    const dirs = new Set<string>((options as { directories?: string[] }).directories ?? DEFAULT_DIRS)
 
     // 1) In-request retries: make network/transient errors retryable for the
     // nvidia provider. The built-in attempt cap still applies inside one
@@ -133,24 +197,16 @@ export default Plugin.define({
 
     if (!REPROMPT) return
 
-    /**
-     * Safety rejections refuse the whole request (history + prompt), so the
-     * only automatic remedy is a clean session: extract a short sanitized
-     * context from the failed session and continue the task there.
-     */
-    async function recoverIntoCleanSession(
-      sessionID: string,
-      directory: string | undefined,
-      reason: string,
-    ): Promise<void> {
+    const paused = (): boolean => existsSync(PAUSE_FILE)
+
+    /** Safety rejections refuse the whole request; continue in a clean session. */
+    async function recoverIntoCleanSession(sessionID: string, directory: string | undefined, reason: string): Promise<void> {
       const messages = await api.session!.context({ sessionID })
       const users = messages
         .map((m) => m as { type?: string; info?: { type?: string }; text?: string })
         .filter((m) => (m.info?.type ?? m.type) === "user")
         .slice(-3)
-      const excerpts = users
-        .map((u, i) => `[${i + 1}] ${truncate(String(u.text ?? ""), 600)}`)
-        .join("\n\n")
+      const excerpts = users.map((u, i) => `[${i + 1}] ${truncate(String(u.text ?? ""), 600)}`).join("\n\n")
       const last = users.length ? String(users[users.length - 1].text ?? "") : ""
       const preamble = [
         "Автовосстановление: предыдущая сессия была остановлена провайдером",
@@ -163,27 +219,166 @@ export default Plugin.define({
         "Последнее задание пользователя:",
         last || "(пусто)",
       ].join("\n")
-
-      const info = await api.session!.get({ sessionID })
-      const model = info?.model ?? info?.info?.model
-      const created = await api.session!.create({
-        directory: directory ?? api.location?.directory,
-        title: `auto-recovery from ${sessionID.slice(4)}`,
-      })
+      const dir = directory ?? api.location?.directory
+      const created = await api.session!.create({ directory: dir, title: `auto-recovery from ${sessionID.slice(4)}` })
       const newID = created?.id ?? created?.info?.id
       if (!newID) throw new Error("session.create returned no id")
-      await api.session!.prompt({
-        sessionID: newID,
-        text: preamble,
-        model: model?.providerID && model?.id ? { providerID: model.providerID, id: model.id } : undefined,
-        delivery: "queue",
-      })
-      dbg(`${PLUGIN} safety recovery: ${sessionID} → new session ${newID} (dir=${directory ?? api.location?.directory})`)
+      createdBy.set(newID, sessionID)
+      chainDepth.set(newID, (chainDepth.get(sessionID) ?? 0) + 1)
+      await api.session!.prompt({ sessionID: newID, text: preamble, delivery: "queue" })
+      dbg(`${PLUGIN} safety recovery: ${sessionID} → ${newID} (dir=${dir}, depth=${chainDepth.get(newID)})`)
     }
 
-    // 2) Final-failure recovery per failure class. Network failures re-prompt
-    // the last user message; safety failures restart in a clean session; the
-    // images limit re-prompts once with a batching hint.
+    /** Switch the session to a working provider route and re-prompt the last
+     *  user message — for deterministic provider errors (missing functions,
+     *  billing) where the current route will keep failing. */
+    async function switchAndRetry(sessionID: string, reason: string): Promise<void> {
+      const messages = await api.session!.context({ sessionID })
+      const target = findLastUser(messages)
+      if (!target) {
+        dbg(`${PLUGIN} switch recovery: no user message for ${sessionID}`)
+        return
+      }
+      let n = (switches.get(sessionID) ?? 0) + 1
+      if (n > FALLBACK.length) {
+        dbg(`${PLUGIN} switch recovery: exhausted ${FALLBACK.length} fallback routes for ${sessionID}`)
+        switches.delete(sessionID)
+        return
+      }
+      const model = FALLBACK[Math.min(n - 1, FALLBACK.length - 1)]
+      const info = await api.session!.get({ sessionID })
+      const current = info?.model ?? info?.info?.model
+      if (current?.providerID === model.providerID && current?.id === model.id && n < FALLBACK.length) n++
+      const route = FALLBACK[Math.min(n - 1, FALLBACK.length - 1)]
+      switches.set(sessionID, n)
+      try {
+        await api.session!.switchModel({ sessionID, model: route })
+      } catch {
+        dbg(`${PLUGIN} switch recovery: switchModel failed for ${sessionID}, retrying with prompt model`)
+      }
+      dbg(`${PLUGIN} deterministic provider failure (${truncate(reason, 80)}): switching ${sessionID} to ${route.providerID}/${route.id} and re-prompting`)
+      setTimeout(() => {
+        void api
+          .session!.prompt({
+            sessionID,
+            text: `${target.text}\n\n[автоподсказка] Предыдущая попытка упала на ошибке «${truncate(reason, 120)}» — продолжай задачу, обойдя проблему.`,
+            files: target.files,
+            delivery: "queue",
+          })
+          .catch((e: unknown) => {
+            switches.delete(sessionID)
+            dbg(`${PLUGIN} switch recovery failed: ${e instanceof Error ? e.message : String(e)}`)
+          })
+      }, DELAY)
+    }
+
+    /** Shared recovery dispatch for both live events and the watchdog scan.
+     *  The scan cannot classify (failed markers carry no error text), so it
+     *  uses one conservative re-prompt per attempt, capped per session. */
+    const scanAttempts = new Map<string, number>()
+    const stuckAttempts = new Map<string, number>()
+    async function handleFailure(
+      sessionID: string,
+      err: ErrShape,
+      directory: string | undefined,
+      fromScan = false,
+    ): Promise<void> {
+      if (paused()) {
+        dbg(`${PLUGIN} paused via ${PAUSE_FILE}, not recovering ${sessionID}`)
+        return
+      }
+      let kind = classify(err.type, err.message)
+      if (fromScan && kind === "unknown") {
+        const n = (scanAttempts.get(sessionID) ?? 0) + 1
+        scanAttempts.set(sessionID, n)
+        if (n > 2) {
+          dbg(`${PLUGIN} scan: ${sessionID} still failing after 2 attempts — needs manual review`)
+          return
+        }
+        dbg(`${PLUGIN} scan: unclassified failure in ${sessionID}, conservative re-prompt #${n}`)
+        const messages = await api.session!.context({ sessionID })
+        const target = findLastUser(messages)
+        if (!target) return
+        setTimeout(() => {
+          void api.session!
+            .prompt({
+              sessionID,
+              text: `${target.text}\n\n[автоподсказка] Предыдущая попытка не завершилась. Продолжи задачу.`,
+              files: target.files,
+              delivery: "queue",
+            })
+            .catch((e: unknown) => dbg(`${PLUGIN} scan re-prompt failed: ${e instanceof Error ? e.message : String(e)}`))
+        }, DELAY)
+        return
+      }
+      const reason = `${err.type ?? "?"}: ${truncate(err.message ?? "", 100)}`
+      switch (kind) {
+        case "safety": {
+          const origin = originOf(sessionID)
+          const n = (recoveries.get(origin) ?? 0) + 1
+          recoveries.set(origin, n)
+          cycles.delete(sessionID)
+          if ((chainDepth.get(sessionID) ?? 0) >= MAX_CHAIN || n > MAX_RECOVERIES) {
+            dbg(`${PLUGIN} giving up on ${sessionID} (chain depth ${chainDepth.get(sessionID) ?? 0}, recoveries ${n} of ${MAX_RECOVERIES} for origin ${origin})`)
+            return
+          }
+          dbg(`${PLUGIN} content-safety rejection for ${sessionID}; clean-session recovery #${n} (origin ${origin})`)
+          await recoverIntoCleanSession(sessionID, directory, reason).catch((e: unknown) =>
+            dbg(`${PLUGIN} safety recovery failed for ${sessionID}: ${e instanceof Error ? e.message : String(e)}`),
+          )
+          return
+        }
+        case "images": {
+          const n = (cycles.get(sessionID) ?? 0) + 1
+          cycles.set(sessionID, n)
+          if (n > 2) {
+            dbg(`${PLUGIN} images-limit persists after 2 hint retries for ${sessionID}, giving up`)
+            cycles.delete(sessionID)
+            return
+          }
+          const messages = await api.session!.context({ sessionID })
+          const target = findLastUser(messages)
+          if (!target) return
+          dbg(`${PLUGIN} images-limit failure for ${sessionID}; re-prompting with batching hint #${n}`)
+          setTimeout(() => {
+            void api.session!
+              .prompt({ sessionID, text: target.text + IMAGES_HINT, files: target.files, delivery: "queue" })
+              .catch((e: unknown) => dbg(`${PLUGIN} images re-prompt failed: ${e instanceof Error ? e.message : String(e)}`))
+          }, DELAY)
+          return
+        }
+        case "switch": {
+          await switchAndRetry(sessionID, reason)
+          return
+        }
+        case "network": {
+          const n = (cycles.get(sessionID) ?? 0) + 1
+          cycles.set(sessionID, n)
+          if (n > MAX_REPROMPTS) {
+            dbg(`${PLUGIN} giving up after ${MAX_REPROMPTS} re-prompt cycles for ${sessionID}`)
+            cycles.delete(sessionID)
+            return
+          }
+          const messages = await api.session!.context({ sessionID })
+          const target = findLastUser(messages)
+          if (!target) return
+          dbg(`${PLUGIN} network failure for ${sessionID} (${reason}); re-prompt scheduled in ${DELAY}ms (auto retry #${n}, files=${target.files?.length ?? 0})`)
+          setTimeout(() => {
+            void api.session!
+              .prompt({ sessionID, text: target.text, files: target.files, delivery: "queue" })
+              .catch((e: unknown) => {
+                cycles.delete(sessionID)
+                dbg(`${PLUGIN} re-prompt failed: ${e instanceof Error ? e.message : String(e)}`)
+              })
+          }, DELAY)
+          return
+        }
+        default:
+          dbg(`${PLUGIN} unrecoverable failure for ${sessionID}: ${reason} — logging only`)
+      }
+    }
+
+    // 2) Event-driven recovery.
     const g = globalThis as { __netzRetryLoop?: AbortController }
     if (g.__netzRetryLoop) {
       dbg(`${PLUGIN} stopping previous subscription instance`)
@@ -199,122 +394,132 @@ export default Plugin.define({
           const typed = event as {
             id?: string
             type?: string
-            data?: FailureEventData & { error?: { type?: string; message?: string } }
-            properties?: FailureEventData
+            data?: { sessionID?: string; error?: ErrShape }
+            properties?: { sessionID?: string; error?: ErrShape }
             location?: { directory?: string }
           }
           const type = typed.type ?? ""
           if (type.includes("failed")) {
             dbg(`${PLUGIN} raw failed event: ${JSON.stringify(event).slice(0, 500)}`)
           }
-          if (
-            type !== "session.execution.failed" &&
-            type !== "session.execution.interrupted" &&
-            type !== "session.execution.succeeded"
-          ) {
-            continue
-          }
-          // The stream can deliver one event twice; process each once only.
+          if (type !== "session.execution.failed") continue
           if (typed.id && seenEvents.has(typed.id)) continue
           if (typed.id) {
             seenEvents.add(typed.id)
             if (seenEvents.size > 5_000) seenEvents.clear()
           }
-          const data = (typed.data ?? typed.properties) ?? {}
+          const data = typed.data ?? typed.properties ?? {}
           const sessionID = data.sessionID
           if (!sessionID) continue
+          if (typed.location?.directory) dirs.add(typed.location.directory)
+          if (type === "session.execution.succeeded") {
+            cycles.delete(sessionID)
+            failedAt.delete(sessionID)
+            continue
+          }
           if (type === "session.execution.interrupted") {
             if (cycles.size) dbg(`${PLUGIN} interrupted by user, stopping loop for ${sessionID}`)
             cycles.delete(sessionID)
             continue
           }
-          if (type === "session.execution.succeeded") {
-            cycles.delete(sessionID)
-            continue
-          }
-          const err = data.error ?? {}
-          const kind = classify(err.type, err.message)
-          if (kind === "unknown") {
-            if (cycles.size) {
-              dbg(`${PLUGIN} terminal failure type=${err.type ?? "?"}: ${truncate(err.message ?? "", 100)} — not re-prompting ${sessionID}`)
-              cycles.delete(sessionID)
-            }
-            continue
-          }
-          if (existsSync(PAUSE_FILE)) {
-            dbg(`${PLUGIN} paused via ${PAUSE_FILE}, not recovering ${sessionID}`)
-            cycles.delete(sessionID)
-            continue
-          }
-          if (kind === "safety") {
-            const n = (recoveries.get(sessionID) ?? 0) + 1
-            recoveries.set(sessionID, n)
-            cycles.delete(sessionID)
-            if (n > MAX_RECOVERIES) {
-              dbg(`${PLUGIN} giving up after ${MAX_RECOVERIES} clean-session recoveries for ${sessionID}`)
-              recoveries.delete(sessionID)
-              continue
-            }
-            dbg(`${PLUGIN} content-safety rejection for ${sessionID}; starting clean-session recovery #${n}`)
-            void recoverIntoCleanSession(sessionID, typed.location?.directory, err.message ?? "content safety screening").catch(
-              (e: unknown) => {
-                dbg(`${PLUGIN} recovery failed for ${sessionID}: ${e instanceof Error ? e.message : String(e)}`)
-              },
-            )
-            continue
-          }
-
-          const attempts = (cycles.get(sessionID) ?? 0) + 1
-          if (attempts > MAX_REPROMPTS) {
-            dbg(`${PLUGIN} giving up after ${MAX_REPROMPTS} re-prompt cycles for ${sessionID}`)
-            cycles.delete(sessionID)
-            continue
-          }
-          cycles.set(sessionID, attempts)
-
-          const messages = await api.session!.context({ sessionID })
-          const target = findLastUser(messages)
-          if (!target) {
-            dbg(`${PLUGIN} no user message with text found for ${sessionID}, not re-prompting`)
-            cycles.delete(sessionID)
-            continue
-          }
-          if (kind === "images") {
-            if (attempts > 2) {
-              dbg(`${PLUGIN} images-limit persists after 2 hint retries for ${sessionID}, giving up`)
-              cycles.delete(sessionID)
-              continue
-            }
-            dbg(`${PLUGIN} images-limit failure for ${sessionID}; re-prompting with batching hint #${attempts}`)
-            setTimeout(() => {
-              void api.session!
-                .prompt({ sessionID: sessionID, text: target.text + IMAGES_HINT, files: target.files, delivery: "queue" })
-                .catch((e: unknown) => {
-                  cycles.delete(sessionID)
-                  dbg(`${PLUGIN} re-prompt failed: ${e instanceof Error ? e.message : String(e)}`)
-                })
-            }, DELAY)
-            continue
-          }
-          dbg(`${PLUGIN} final network failure for ${sessionID}: type=${err.type ?? "?"} message=${truncate(err.message ?? "", 120)}`)
-          dbg(`${PLUGIN} re-prompt scheduled for ${sessionID} in ${DELAY}ms (auto retry #${attempts}, files=${target.files?.length ?? 0})`)
-          setTimeout(() => {
-            void api.session!
-              .prompt({ sessionID, text: target.text, files: target.files, delivery: "queue" })
-              .catch((e: unknown) => {
-                cycles.delete(sessionID)
-                dbg(`${PLUGIN} re-prompt failed: ${e instanceof Error ? e.message : String(e)}`)
-              })
-          }, DELAY)
+          await handleFailure(sessionID, data.error ?? {}, typed.location?.directory)
         } catch (err) {
           dbg(`${PLUGIN} event handling failed: ${err instanceof Error ? err.message : String(err)}`)
         }
       }
     })()
 
+    // 3) Watchdog: catches failures that never emit an event (server restart,
+    //    dead subscription window) by scanning recent sessions periodically.
+    const findFailedIdle = (messages: readonly unknown[]): number | undefined => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i] as { type?: string; info?: { type?: string }; outcome?: string; time?: { created?: number } }
+        const outcome = m.outcome ?? (m.info as { outcome?: string } | undefined)?.outcome
+        if (outcome === "failed") return m.time?.created ?? (m.info as { time?: { created?: number } } | undefined)?.time?.created ?? 0
+        const kind = m.info?.type ?? m.type
+        if (kind === "assistant" || kind === "user" || kind === "compaction") return undefined
+      }
+      return undefined
+    }
+
+    async function scan(): Promise<void> {
+      let checked = 0
+      let recovered = 0
+      for (const dir of [...dirs]) {
+        let list: SessionInfoLite[] = []
+        try {
+          const page = await api.session!.list({ directory: dir, limit: 40 })
+          list = page?.data ?? page?.info ?? []
+        } catch (e) {
+          dbg(`${PLUGIN} scan: list failed for ${dir}: ${e instanceof Error ? e.message : String(e)}`)
+          continue
+        }
+        for (const s of list) {
+          const sessionID = s.id ?? s.info?.id
+          if (!sessionID) continue
+          const updated = s.time?.updated ?? s.info?.time?.updated
+          // Failed sessions are by definition stale, so do not skip them by recency;
+          // only skip sessions untouched for a day (abandoned).
+          if (updated && Date.now() - updated > 24 * 3600_000) continue
+          let messages: readonly unknown[]
+          try {
+            messages = await api.session!.context({ sessionID })
+          } catch {
+            continue
+          }
+          checked++
+          const failedTime = findFailedIdle(messages)
+          if (!failedTime || failedTime <= (failedAt.get(sessionID) ?? 0)) {
+            // Hung step (no failure event, no new messages for STUCK_MS):
+            // with headerTimeout:false a dead socket waits forever.
+            const last = messages[messages.length - 1] as {
+              type?: string
+              info?: { type?: string }
+              time?: { created?: number }
+              info2?: unknown
+            }
+            const lastKind = last?.info?.type ?? last?.type
+            const lastAt = last?.time?.created ?? 0
+            if ((lastKind === "assistant" || lastKind === "compaction" || lastKind === "user") && lastAt && Date.now() - lastAt > STUCK_MS) {
+              const n = (stuckAttempts.get(sessionID) ?? 0) + 1
+              stuckAttempts.set(sessionID, n)
+              if (n <= 2) {
+                dbg(`${PLUGIN} scan: ${sessionID} stuck for ${Math.round((Date.now() - lastAt) / 60000)}min — interrupting and re-prompting (#${n})`)
+                void api.session!.interrupt({ sessionID }).catch(() => undefined)
+                const target = findLastUser(messages)
+                if (target) {
+                  setTimeout(() => {
+                    void api.session!
+                      .prompt({
+                        sessionID,
+                        text: `${target.text}\n\n[автоподсказка] Предыдущий шаг завис и был прерван автоматически. Продолжи задачу.`,
+                        files: target.files,
+                        delivery: "queue",
+                      })
+                      .catch((e: unknown) => dbg(`${PLUGIN} stuck re-prompt failed: ${e instanceof Error ? e.message : String(e)}`))
+                  }, 5_000)
+                }
+                recovered++
+              }
+            }
+            continue
+          }
+          failedAt.set(sessionID, failedTime)
+          dbg(`${PLUGIN} scan: new failed state in ${sessionID} at ${new Date(failedTime).toISOString()}`)
+          recovered++
+          await handleFailure(sessionID, { type: "unknown", message: "" }, dir, true)
+        }
+      }
+      if (checked || recovered) dbg(`${PLUGIN} scan done: ${checked} sessions checked, ${recovered} recovered`)
+    }
+
+    const scanT = setInterval(() => void scan().catch((e) => dbg(`${PLUGIN} scan failed: ${e instanceof Error ? e.message : String(e)}`)), SCAN_MS)
+    dbg(`${PLUGIN} watchdog armed: every ${SCAN_MS}ms over dirs ${[...dirs].join(", ")}`)
+
     return () => {
       if (g.__netzRetryLoop === controller) delete g.__netzRetryLoop
       controller.abort()
+      clearInterval(scanT)
     }
   },
 })
