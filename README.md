@@ -51,8 +51,24 @@ Options (via the object plugin form):
 
 ## Behavior and limitations
 
+- Automatic recovery is keyed to the failure class:
+  - **network** (`getaddrinfo ETIMEDOUT/EAI_AGAIN`, 429, 500/502/503/504) —
+    re-sends the last user message until it succeeds.
+  - **content safety screening** (`input rejected by content safety screening`)
+    — retrying the same input never succeeds: the provider refuses the whole
+    request (history + prompt). The plugin continues the task in a **new
+    session** with a sanitized context (excerpts of the last user messages,
+    at most 1200 chars each, at most 3 messages) and the same model.
+  - **images limit** (`At most 8 image(s) ... --limit-mm-per-prompt`) —
+    re-sends the last user message once with a batching hint (max 8 images per
+    CLI call).
+  - **everything else** (auth, billing, validation, "Function ... Not found") —
+    deliberately not retried; the debug log records the classification.
+- An optional pause switch stops all automatic recovery immediately:
+  `touch /tmp/opencode/netz-retry-paused` (resume: `rm ...`).
 - Every auto re-prompt appends a new copy of the user message to the session
-  history (this is inherent to re-submitting a prompt).
+  history (this is inherent to re-submitting a prompt); a safety recovery
+  creates a new session instead.
 - File/image attachments are re-sent as plain text only; only the text part is
   carried over.
 - Restriction on layer 1: the built-in retry attempt cap is a hard limit in
