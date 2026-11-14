@@ -53,6 +53,19 @@ const truncate = (s: string, n: number): string => (s.length > n ? s.slice(0, n)
 
 // Presence of this file pauses every automatic recovery immediately.
 const PAUSE_FILE = "/tmp/opencode/netz-retry-paused"
+// Session IDs (one per line, matched by substring) that automatic recovery
+// must leave alone — e.g. a session deliberately abandoned after its work
+// moved to a continuation.
+const EXCLUDE_FILE = "/tmp/opencode/netz-retry-exclude.txt"
+
+function excluded(sessionID: string): boolean {
+  try {
+    const raw = readFileSync(EXCLUDE_FILE, "utf8")
+    return raw.split("\n").some((l) => l.trim() && sessionID.includes(l.trim()))
+  } catch {
+    return false
+  }
+}
 
 const PLUGIN = "[netz-retry]"
 const DEBUG = "/tmp/opencode/netz-retry-debug.log"
@@ -457,6 +470,11 @@ export default Plugin.define({
         dbg(`${PLUGIN} paused via ${PAUSE_FILE}, not recovering ${sessionID}`)
         return
       }
+      if (excluded(sessionID)) {
+        dbg(`${PLUGIN} ${sessionID} is in the exclude list, leaving it alone`)
+        cycles.delete(sessionID)
+        return
+      }
       if (!lockSession(sessionID)) {
         dbg(`${PLUGIN} another instance is already recovering ${sessionID}, skipping`)
         return
@@ -511,6 +529,7 @@ export default Plugin.define({
           if (type === "session.execution.succeeded") {
             cycles.delete(sessionID)
             failedAt.delete(sessionID)
+            selfInterrupted.delete(sessionID)
             continue
           }
           if (type === "session.execution.interrupted") {
@@ -527,11 +546,22 @@ export default Plugin.define({
 
     // 3) Watchdog: catches failures that never emit an event (server restart,
     //    dead subscription window) by scanning recent sessions periodically.
-    const findFailedIdle = (messages: readonly unknown[]): number | undefined => {
+    // Sessions the plugin interrupted itself: their "interrupted" state needs
+    // recovery; a user-initiated interrupt does not.
+    const selfInterrupted = new Set<string>()
+    const findFailedIdle = (messages: readonly unknown[], sessionID: string): number | undefined => {
       for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i] as { type?: string; info?: { type?: string }; outcome?: string; time?: { created?: number } }
-        const outcome = m.outcome ?? (m.info as { outcome?: string } | undefined)?.outcome
-        if (outcome === "failed") return m.time?.created ?? (m.info as { time?: { created?: number } } | undefined)?.time?.created ?? 0
+        const m = messages[i] as {
+          type?: string
+          info?: { type?: string; outcome?: string; time?: { created?: number } }
+          outcome?: string
+          time?: { created?: number }
+        }
+        const outcome = m.outcome ?? m.info?.outcome
+        const t = m.time?.created ?? m.info?.time?.created
+        // "failed" always; "interrupted" only when the plugin itself interrupted
+        // the session (a manual Esc must stop the session for good).
+        if (outcome === "failed" || (outcome === "interrupted" && selfInterrupted.has(sessionID))) return t ?? 0
         const kind = m.info?.type ?? m.type
         if (kind === "assistant" || kind === "user" || kind === "compaction") return undefined
       }
@@ -574,6 +604,7 @@ export default Plugin.define({
           const sessionID = s.id ?? s.info?.id
           if (!sessionID || handled.has(sessionID)) continue
           handled.add(sessionID)
+          if (excluded(sessionID)) continue
           const updated = s.time?.updated ?? s.info?.time?.updated
           // Failed sessions are by definition stale, so do not skip them by recency;
           // only skip sessions untouched for a day (abandoned).
@@ -585,7 +616,7 @@ export default Plugin.define({
             continue
           }
           checked++
-          const failedTime = findFailedIdle(messages)
+          const failedTime = findFailedIdle(messages, sessionID)
           if (!failedTime || failedTime <= (failedAt.get(sessionID) ?? 0)) {
             // Hung step (no failure event, no new messages for STUCK_MS):
             // with headerTimeout:false a dead socket waits forever.
@@ -603,6 +634,7 @@ export default Plugin.define({
               if (n <= 2) {
                 dbg(`${PLUGIN} scan: ${sessionID} stuck for ${Math.round((Date.now() - lastAt) / 60000)}min — interrupting and re-prompting (#${n})`)
                 void api.session!.interrupt({ sessionID }).catch(() => undefined)
+                selfInterrupted.add(sessionID)
                 const target = findLastUser(messages)
                 if (target) {
                   setTimeout(() => {
