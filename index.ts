@@ -30,6 +30,9 @@ const IMAGES_LIMIT = /at most \d+ image|limit-mm-per-prompt/i
 const PROVIDER_404 =
   /Function id .* not found|Specified function in account .* is not found|functions? .* (?:not found|not available)/i
 const GATEWAY = /credit card|AI Gateway requires|billing|payment required|insufficient (?:quota|credits)/i
+// The selected model no longer exists for the provider (route dropped after a
+// catalog/restart change): deterministic, fixed by switching models.
+const NO_ROUTE = /model unavailable|no-route|model .* (?:not found|does not exist|unavailable)/i
 
 const IMAGES_HINT =
   "\n\n[автоподсказка] Внешний CLI принимает максимум 8 изображений в одном запросе — разбей на батчи по 8 и суммируй результаты. Ошибку 'At most 8 image(s)' не повторяй."
@@ -44,7 +47,7 @@ function classify(type?: string, message?: string): FailureKind {
   const blob = `${type ?? ""}\n${message ?? ""}`
   if (SAFETY.test(blob)) return "safety"
   if (IMAGES_LIMIT.test(blob)) return "images"
-  if (PROVIDER_404.test(blob) || GATEWAY.test(blob)) return "switch"
+  if (PROVIDER_404.test(blob) || GATEWAY.test(blob) || NO_ROUTE.test(blob)) return "switch"
   if (retryable(type, message)) return "network"
   return "unknown"
 }
@@ -226,7 +229,10 @@ export default Plugin.define({
     const FALLBACK: Array<{ providerID: string; id: string }> =
       options.fallback && options.fallback.length
         ? options.fallback
-        : [{ providerID: "cloudflare-workers-ai", id: "@cf/zai-org/glm-4.7-flash" }]
+        : [
+      { providerID: "nvidia", id: "deepseek-ai/deepseek-v4.1-flash" },
+      { providerID: "cloudflare-workers-ai", id: "@cf/zai-org/glm-4.7-flash" },
+    ]
     // Safety valves.
     const MAX_REPROMPTS = 120
     const MAX_RECOVERIES = 3
