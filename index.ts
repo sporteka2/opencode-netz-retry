@@ -472,7 +472,7 @@ export default Plugin.define({
       } finally {
         releaseLock(sessionID)
       }
-
+    }
 
     // 2) Event-driven recovery.
     const g = globalThis as { __netzRetryLoop?: AbortController }
@@ -631,23 +631,16 @@ export default Plugin.define({
           await handleFailure(sessionID, rememberedErr.get(sessionID) ?? { type: "unknown", message: "" }, dir, remembered === "unknown")
         }
       }
-      if (checked || recovered) {
-        dbg(`${PLUGIN} scan done: ${checked} sessions checked, ${recovered} recovered`)
-        try {
-          unlinkSync(`${LOCK_DIR}/watchdog`)
-        } catch { /* already released */ }
-      } else {
-        try {
-          unlinkSync(`${LOCK_DIR}/watchdog`)
-        } catch { /* already released */ }
-      }
-        try {
-          appendFileSync(
-            `${DEBUG}.status`,
-            `${new Date().toISOString()} checked=${checked} recovered=${recovered} dirs=${dirs.size} failedTracked=${failedAt.size} recoveries=${recoveries.size}\n`,
-          )
-        } catch { /* status file is best-effort */ }
-      }
+      if (checked || recovered) dbg(`${PLUGIN} scan done: ${checked} sessions checked, ${recovered} recovered`)
+      try {
+        appendFileSync(
+          `${DEBUG}.status`,
+          `${new Date().toISOString()} checked=${checked} recovered=${recovered} dirs=${dirs.size} failedTracked=${failedAt.size}\n`,
+        )
+      } catch { /* status file is best-effort */ }
+      try {
+        unlinkSync(`${LOCK_DIR}/watchdog`)
+      } catch { /* already released */ }
     }
 
     const scanT = setInterval(() => void scan().catch((e) => dbg(`${PLUGIN} scan failed: ${e instanceof Error ? e.message : String(e)}`)), SCAN_MS)
