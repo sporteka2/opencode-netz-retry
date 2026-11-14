@@ -74,16 +74,24 @@ const LOCK_DIR = "/tmp/opencode/netz-retry-locks"
 
 /** Cross-restart recovery-chain state, so reloading the plugin cannot reset
  *  the budget of a chain that is already three sessions deep. */
-function loadChain(): { createdBy: Record<string, string>; depth: Record<string, number> } {
+function loadChain(): {
+  createdBy: Record<string, string>
+  depth: Record<string, number>
+  scan: Record<string, number>
+} {
   try {
     const raw = readFileSync(CHAIN_FILE, "utf8")
-    const parsed = JSON.parse(raw) as { createdBy?: Record<string, string>; depth?: Record<string, number> }
-    return { createdBy: parsed.createdBy ?? {}, depth: parsed.depth ?? {} }
+    const parsed = JSON.parse(raw) as {
+      createdBy?: Record<string, string>
+      depth?: Record<string, number>
+      scan?: Record<string, number>
+    }
+    return { createdBy: parsed.createdBy ?? {}, depth: parsed.depth ?? {}, scan: parsed.scan ?? {} }
   } catch {
-    return { createdBy: {}, depth: {} }
+    return { createdBy: {}, depth: {}, scan: {} }
   }
 }
-function saveChain(createdBy: Map<string, string>, depth: Map<string, number>): void {
+function saveChain(createdBy: Map<string, string>, depth: Map<string, number>, scan?: Map<string, number>): void {
   try {
     mkdirSync("/tmp/opencode", { recursive: true })
     writeFileSync(
@@ -91,6 +99,7 @@ function saveChain(createdBy: Map<string, string>, depth: Map<string, number>): 
       JSON.stringify({
         createdBy: Object.fromEntries(createdBy),
         depth: Object.fromEntries(depth),
+        scan: scan ? Object.fromEntries(scan) : undefined,
       }),
     )
   } catch { /* persistence is best-effort */ }
@@ -282,7 +291,12 @@ export default Plugin.define({
     const paused = (): boolean => existsSync(PAUSE_FILE)
 
     /** Safety rejections refuse the whole request; continue in a clean session. */
-    async function recoverIntoCleanSession(sessionID: string, directory: string | undefined, reason: string): Promise<void> {
+    async function recoverIntoCleanSession(
+      sessionID: string,
+      directory: string | undefined,
+      reason: string,
+      attempt = 1,
+    ): Promise<void> {
       const messages = await api.session!.context({ sessionID })
       const users = messages
         .map((m) => m as { type?: string; info?: { type?: string }; text?: string })
@@ -290,17 +304,30 @@ export default Plugin.define({
         .slice(-3)
       const excerpts = users.map((u, i) => `[${i + 1}] ${truncate(String(u.text ?? ""), 600)}`).join("\n\n")
       const last = users.length ? String(users[users.length - 1].text ?? "") : ""
-      const preamble = [
-        "Автовосстановление: предыдущая сессия была остановлена провайдером",
-        `(«${truncate(reason, 120)}»). Накопленная история отфильтрована модерацией,`,
-        "поэтому контекст намеренно очищен. Ниже — краткие выдержки последних",
-        "пользовательских сообщений. Продолжи задачу, при необходимости уточни.",
-        "",
-        excerpts || "(выдержек нет)",
-        "",
-        "Последнее задание пользователя:",
-        last || "(пусто)",
-      ].join("\n")
+      // Second and later attempts send a minimal preamble: carrying excerpts
+      // again would just reproduce the filtered content. For these tasks the
+      // real state lives in the repository, so a clean restart can rediscover
+      // it from files.
+      const preamble =
+        attempt >= 2
+          ? [
+              "Автовосстановление: предыдущая сессия снова была остановлена провайдером",
+              `(«${truncate(reason, 120)}»). Контекст намеренно минимален.`,
+              "Определи текущее состояние задачи по файлам проекта (git status,",
+              "git log, README, скрипты), кратко опиши его и продолжи работу.",
+              "Если нужно решение пользователя — задай вопрос.",
+            ].join("\n")
+          : [
+              "Автовосстановление: предыдущая сессия была остановлена провайдером",
+              `(«${truncate(reason, 120)}»). Накопленная история отфильтрована модерацией,`,
+              "поэтому контекст намеренно очищен. Ниже — краткие выдержки последних",
+              "пользовательских сообщений. Продолжи задачу, при необходимости уточни.",
+              "",
+              excerpts || "(выдержек нет)",
+              "",
+              "Последнее задание пользователя:",
+              last || "(пусто)",
+            ].join("\n")
       const dir = directory ?? api.location?.directory
       const created = await api.session!.create({ directory: dir, title: `auto-recovery from ${sessionID.slice(4)}` })
       const newID = created?.id ?? created?.info?.id
@@ -359,6 +386,7 @@ export default Plugin.define({
      *  The scan cannot classify (failed markers carry no error text), so it
      *  uses one conservative re-prompt per attempt, capped per session. */
     const scanAttempts = new Map<string, number>()
+    for (const [k, v] of Object.entries(loadChain().scan)) scanAttempts.set(k, v)
     const stuckAttempts = new Map<string, number>()
     async function handleFailureLocked(
       sessionID: string,
@@ -374,6 +402,7 @@ export default Plugin.define({
       if (fromScan && kind === "unknown") {
         const n = (scanAttempts.get(sessionID) ?? 0) + 1
         scanAttempts.set(sessionID, n)
+        saveChain(createdBy, chainDepth, scanAttempts)
         if (n > 2) {
           dbg(`${PLUGIN} scan: ${sessionID} still failing after 2 attempts — needs manual review`)
           return
@@ -406,7 +435,7 @@ export default Plugin.define({
             return
           }
           dbg(`${PLUGIN} content-safety rejection for ${sessionID}; clean-session recovery #${n} (origin ${origin})`)
-          await recoverIntoCleanSession(sessionID, directory, reason).catch((e: unknown) =>
+          await recoverIntoCleanSession(sessionID, directory, reason, n).catch((e: unknown) =>
             dbg(`${PLUGIN} safety recovery failed for ${sessionID}: ${e instanceof Error ? e.message : String(e)}`),
           )
           return
