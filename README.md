@@ -49,6 +49,20 @@ Options (via the object plugin form):
 }
 ```
 
+## Health check
+
+The watchdog writes a status line after every scan. If the newest line is
+older than ~10 minutes, automatic protection is down (plugin not loaded,
+server restarted, or a broken edit):
+
+```sh
+tail -1 /tmp/opencode/netz-retry-debug.log.status
+opencode api get /api/plugin | grep -o '"id":"netz-retry".\{0,45\}'
+```
+
+A healthy system shows `checked=N recovered=M` lines appearing every ~3
+minutes and `plugin state: active`.
+
 ## Behavior and limitations
 
 - Automatic recovery is keyed to the failure class:
