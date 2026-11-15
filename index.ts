@@ -30,6 +30,9 @@ const IMAGES_LIMIT = /at most \d+ image|limit-mm-per-prompt/i
 const PROVIDER_404 =
   /Function id .* not found|Specified function in account .* is not found|functions? .* (?:not found|not available)/i
 const GATEWAY = /credit card|AI Gateway requires|billing|payment required|insufficient (?:quota|credits)/i
+// Provider quota exhausted for the day (Cloudflare free neurons, etc.): fixed
+// by moving to another route, retrying the same one never succeeds today.
+const QUOTA = /daily free allocation|free allocation of .*neuron|upgrade to .{0,30}paid plan|quota (?:exceeded|exhausted)/i
 // The selected model no longer exists for the provider (route dropped after a
 // catalog/restart change): deterministic, fixed by switching models.
 const NO_ROUTE = /model unavailable|no-route|model .* (?:not found|does not exist|unavailable)/i
@@ -47,7 +50,7 @@ function classify(type?: string, message?: string): FailureKind {
   const blob = `${type ?? ""}\n${message ?? ""}`
   if (SAFETY.test(blob)) return "safety"
   if (IMAGES_LIMIT.test(blob)) return "images"
-  if (PROVIDER_404.test(blob) || GATEWAY.test(blob) || NO_ROUTE.test(blob)) return "switch"
+  if (PROVIDER_404.test(blob) || GATEWAY.test(blob) || QUOTA.test(blob) || NO_ROUTE.test(blob)) return "switch"
   if (retryable(type, message)) return "network"
   return "unknown"
 }
