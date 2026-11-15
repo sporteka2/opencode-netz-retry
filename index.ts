@@ -222,8 +222,14 @@ export default Plugin.define({
     const DELAY = Math.max(1_000, options.delay ?? 10_000)
     const SCAN_MS = Math.max(60_000, options.scanMs ?? 180_000)
     // A step silent for this long is treated as hung (headerTimeout:false
-    // means a dead socket never errors by itself).
-    const STUCK_MS = Math.max(120_000, options.stuckMs ?? 600_000)
+    // means a dead socket never errors by itself). Network retry storms keep a
+    // step silent for many minutes without being hung, hence the generous
+    // default plus the retry-activity guard below.
+    const STUCK_MS = Math.max(120_000, options.stuckMs ?? 1_800_000)
+    // Last time the provider actually tried (retry hook or failure event).
+    // While the transport keeps retrying, silence is not a hang.
+    let lastProviderActivity = 0
+    const RETRY_QUIET_MS = 5 * 60_000
     // Provider to switch to when the current route fails deterministically
     // (missing NVIDIA "functions", gateway without billing, ...).
     const FALLBACK: Array<{ providerID: string; id: string }> =
@@ -234,7 +240,6 @@ export default Plugin.define({
       { providerID: "cloudflare-workers-ai", id: "@cf/zai-org/glm-4.7-flash" },
     ]
     // Safety valves.
-    const MAX_REPROMPTS = 120
     const MAX_RECOVERIES = 3
     // Depth of automatic recovery chains (a recovery of a recovery of ...).
     const MAX_CHAIN = 3
@@ -289,6 +294,7 @@ export default Plugin.define({
         ? Math.max(1_000, options.delay)
         : Math.min(20_000, 5_000 * event.attempt)
       dbg(`${PLUGIN} network failure on attempt ${event.attempt}, retry in ${delay}ms (type=${event.error.type})`)
+      lastProviderActivity = Date.now()
       event.decision = { retry: true, delay }
     })
 
@@ -409,8 +415,8 @@ export default Plugin.define({
         const n = (scanAttempts.get(sessionID) ?? 0) + 1
         scanAttempts.set(sessionID, n)
         saveChain(createdBy, chainDepth, scanAttempts)
-        if (n > 2) {
-          dbg(`${PLUGIN} scan: ${sessionID} still failing after 2 attempts — needs manual review`)
+        if (n > 6) {
+          dbg(`${PLUGIN} scan: ${sessionID} still failing after 6 attempts — needs manual review`)
           return
         }
         dbg(`${PLUGIN} scan: unclassified failure in ${sessionID}, conservative re-prompt #${n}`)
@@ -472,15 +478,14 @@ export default Plugin.define({
         case "network": {
           const n = (cycles.get(sessionID) ?? 0) + 1
           cycles.set(sessionID, n)
-          if (n > MAX_REPROMPTS) {
-            dbg(`${PLUGIN} giving up after ${MAX_REPROMPTS} re-prompt cycles for ${sessionID}`)
-            cycles.delete(sessionID)
-            return
-          }
+          // No hard cap: the user wants sessions to wait through outages until
+          // recovery is stopped manually (pause file). Back off up to 2 minutes
+          // so a long outage does not turn into a request flood.
+          const backoff = Math.min(120_000, DELAY * Math.pow(1.5, Math.min(8, n - 1)))
           const messages = await api.session!.context({ sessionID })
           const target = findLastUser(messages)
           if (!target) return
-          dbg(`${PLUGIN} network failure for ${sessionID} (${reason}); re-prompt scheduled in ${DELAY}ms (auto retry #${n}, files=${target.files?.length ?? 0})`)
+          dbg(`${PLUGIN} network failure for ${sessionID} (${reason}); re-prompt scheduled in ${backoff}ms (auto retry #${n}, files=${target.files?.length ?? 0})`)
           setTimeout(() => {
             void api.session!
               .prompt({ sessionID, text: target.text, files: target.files, delivery: "queue" })
@@ -488,7 +493,7 @@ export default Plugin.define({
                 cycles.delete(sessionID)
                 dbg(`${PLUGIN} re-prompt failed: ${e instanceof Error ? e.message : String(e)}`)
               })
-          }, DELAY)
+          }, backoff)
           return
         }
         default:
@@ -663,7 +668,12 @@ export default Plugin.define({
             }
             const lastKind = last?.info?.type ?? last?.type
             const lastAt = last?.time?.created ?? 0
-            if ((lastKind === "assistant" || lastKind === "compaction" || lastKind === "user") && lastAt && Date.now() - lastAt > STUCK_MS) {
+            if (
+              (lastKind === "assistant" || lastKind === "compaction" || lastKind === "user") &&
+              lastAt &&
+              Date.now() - lastAt > STUCK_MS &&
+              Date.now() - lastProviderActivity > RETRY_QUIET_MS
+            ) {
               const n = (stuckAttempts.get(sessionID) ?? 0) + 1
               stuckAttempts.set(sessionID, n)
               if (n <= 2) {
