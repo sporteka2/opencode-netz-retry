@@ -27,8 +27,11 @@ const IMAGES_LIMIT = /at most \d+ image|limit-mm-per-prompt/i
 
 // Deterministic provider-side errors that a different provider route avoids:
 // NVIDIA "functions" that do not exist for the account, and gateway billing.
+// NOTE: NVIDIA "Function '<uuid>': Not found for account '<id>'" is
+// intentionally NOT classified as provider-switch (user decision): recover via
+// compaction / manual route change instead of automatic model switching.
 const PROVIDER_404 =
-  /Function id .* not found|Specified function in account .* is not found|functions? .* (?:not found|not available)|[Ff]unction\s+'[^']+'\s*:\s*(?:not found|does not exist)\s+for\s+account/i
+  /Function id .* not found|Specified function in account .* is not found|functions? .* (?:not found|not available)/i
 const GATEWAY = /credit card|AI Gateway requires|billing|payment required|insufficient (?:quota|credits)/i
 // Provider quota exhausted for the day (Cloudflare free neurons, etc.): fixed
 // by moving to another route, retrying the same one never succeeds today.
