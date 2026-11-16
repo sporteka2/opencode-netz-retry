@@ -671,16 +671,32 @@ export default Plugin.define({
             }
             const lastKind = last?.info?.type ?? last?.type
             const lastAt = last?.time?.created ?? 0
+            // Frozen UI symptom: a user message that never got an assistant
+            // reply (the session claims "succeeded" but the answer never
+            // arrived and the spinner keeps spinning).
+            let lastUserAt = 0
+            let lastAssistantAt = 0
+            for (const m of messages) {
+              const kind = ((m as { info?: { type?: string } })?.info?.type ?? (m as { type?: string }).type) as string | undefined
+              const t = (m as { time?: { created?: number } })?.time?.created ?? 0
+              if (kind === "user" && t > lastUserAt) lastUserAt = t
+              if (kind === "assistant" && t > lastAssistantAt) lastAssistantAt = t
+            }
+            const unanswered =
+              Date.now() - lastProviderActivity > RETRY_QUIET_MS &&
+              lastUserAt > lastAssistantAt + 1_000 &&
+              lastUserAt &&
+              Date.now() - lastUserAt > STUCK_MS
             if (
-              (lastKind === "assistant" || lastKind === "compaction" || lastKind === "user") &&
-              lastAt &&
-              Date.now() - lastAt > STUCK_MS &&
-              Date.now() - lastProviderActivity > RETRY_QUIET_MS
+              ((lastKind === "assistant" || lastKind === "compaction" || lastKind === "user") &&
+                lastAt &&
+                Date.now() - lastAt > STUCK_MS) ||
+              unanswered
             ) {
               const n = (stuckAttempts.get(sessionID) ?? 0) + 1
               stuckAttempts.set(sessionID, n)
               if (n <= 2) {
-                dbg(`${PLUGIN} scan: ${sessionID} stuck for ${Math.round((Date.now() - lastAt) / 60000)}min — interrupting and re-prompting (#${n})`)
+                dbg(`${PLUGIN} scan: ${sessionID} stuck for ${Math.round((Date.now() - (unanswered ? lastUserAt : lastAt)) / 60000)}min — interrupting and re-prompting (#${n})`)
                 void api.session!.interrupt({ sessionID }).catch(() => undefined)
                 selfInterrupted.add(sessionID)
                 const target = findLastUser(messages)
