@@ -245,9 +245,7 @@ export default Plugin.define({
       options.fallback && options.fallback.length
         ? options.fallback
         : [
-      // deepseek-v4.1-flash hit end-of-life (Nov 2026) — replaced by live routes.
-      { providerID: "nvidia", id: "minimaxai/minimax-m3.1-flash" },
-      { providerID: "nvidia", id: "openai/gpt-oss-20b" },
+      { providerID: "nvidia", id: "deepseek-ai/deepseek-v4.1-flash" },
       { providerID: "cloudflare-workers-ai", id: "@cf/zai-org/glm-4.7-flash" },
     ]
     // Safety valves.
