@@ -244,10 +244,7 @@ export default Plugin.define({
     const FALLBACK: Array<{ providerID: string; id: string }> =
       options.fallback && options.fallback.length
         ? options.fallback
-        : [
-      { providerID: "nvidia", id: "deepseek-ai/deepseek-v4.1-flash" },
-      { providerID: "cloudflare-workers-ai", id: "@cf/zai-org/glm-4.7-flash" },
-    ]
+        : [{ providerID: "cloudflare-workers-ai", id: "@cf/zai-org/glm-4.7-flash" }]
     // Safety valves.
     const MAX_RECOVERIES = 3
     // Depth of automatic recovery chains (a recovery of a recovery of ...).
