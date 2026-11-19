@@ -39,6 +39,9 @@ const QUOTA = /daily free allocation|free allocation of .*neuron|upgrade to .{0,
 // The selected model no longer exists for the provider (route dropped after a
 // catalog/restart change): deterministic, fixed by switching models.
 const NO_ROUTE = /model unavailable|no-route|model .* (?:not found|does not exist|unavailable)/i
+// The route's model was retired by the provider (the catalog may still list
+// it; the live API rejects it). Deterministic — switch routes.
+const EOL = /has reached its end of life|has been (?:deprecated|retired)|end of life|model .*(?:deprecated|retired)/i
 
 const IMAGES_HINT =
   "\n\n[автоподсказка] Внешний CLI принимает максимум 8 изображений в одном запросе — разбей на батчи по 8 и суммируй результаты. Ошибку 'At most 8 image(s)' не повторяй."
@@ -53,7 +56,7 @@ function classify(type?: string, message?: string): FailureKind {
   const blob = `${type ?? ""}\n${message ?? ""}`
   if (SAFETY.test(blob)) return "safety"
   if (IMAGES_LIMIT.test(blob)) return "images"
-  if (PROVIDER_404.test(blob) || GATEWAY.test(blob) || QUOTA.test(blob) || NO_ROUTE.test(blob)) return "switch"
+  if (PROVIDER_404.test(blob) || GATEWAY.test(blob) || QUOTA.test(blob) || NO_ROUTE.test(blob) || EOL.test(blob)) return "switch"
   if (retryable(type, message)) return "network"
   return "unknown"
 }
@@ -242,7 +245,9 @@ export default Plugin.define({
       options.fallback && options.fallback.length
         ? options.fallback
         : [
-      { providerID: "nvidia", id: "deepseek-ai/deepseek-v4.1-flash" },
+      // deepseek-v4.1-flash hit end-of-life (Nov 2026) — replaced by live routes.
+      { providerID: "nvidia", id: "minimaxai/minimax-m3.1-flash" },
+      { providerID: "nvidia", id: "openai/gpt-oss-20b" },
       { providerID: "cloudflare-workers-ai", id: "@cf/zai-org/glm-4.7-flash" },
     ]
     // Safety valves.
